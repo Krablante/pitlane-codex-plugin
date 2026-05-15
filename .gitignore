@@ -1,0 +1,20 @@
+# Local runtime and operator surfaces
+.env
+.env.*
+!.env.example
+AGENTS.md
+AGENTS.local.md
+atlas.toml
+
+# Python/test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local outputs
+*.log
+logs/
+tmp/
+.cache/
+artifacts/
+reports/

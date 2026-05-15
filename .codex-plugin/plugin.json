@@ -1,0 +1,29 @@
+{
+  "name": "pitlane-codex-plugin",
+  "version": "0.1.0",
+  "description": "Pitlane PreToolUse hook for token-efficient Codex code navigation.",
+  "author": {
+    "name": "Pitlane Codex Plugin Maintainers"
+  },
+  "license": "MIT",
+  "keywords": [
+    "pitlane",
+    "codex",
+    "hooks",
+    "code-navigation"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "Pitlane",
+    "shortDescription": "Routes broad source reads to Pitlane.",
+    "longDescription": "Uses Codex PreToolUse hooks to rewrite eligible source-code inspection commands to Pitlane CLI calls while leaving exact-output, build, test, and data commands alone.",
+    "developerName": "Pitlane Codex Plugin Maintainers",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Hooks",
+      "Shell",
+      "Code Navigation"
+    ]
+  }
+}

@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+BYPASS_ENV = {
+    "PITLANE_CODEX_HOOK_DISABLE",
+    "PITLANE_CODEX_BYPASS",
+    "PITLANE_DISABLE",
+    "PITLANE_DISABLED",
+}
+
+SOURCE_EXTS = {
+    ".bash",
+    ".c",
+    ".cc",
+    ".cjs",
+    ".clj",
+    ".cpp",
+    ".cs",
+    ".css",
+    ".erl",
+    ".ex",
+    ".exs",
+    ".fish",
+    ".go",
+    ".h",
+    ".hpp",
+    ".hrl",
+    ".html",
+    ".java",
+    ".js",
+    ".jsx",
+    ".kt",
+    ".kts",
+    ".lua",
+    ".mjs",
+    ".php",
+    ".pl",
+    ".pm",
+    ".py",
+    ".rb",
+    ".rs",
+    ".scala",
+    ".scss",
+    ".sh",
+    ".sql",
+    ".svelte",
+    ".swift",
+    ".toml",
+    ".ts",
+    ".tsx",
+    ".vue",
+    ".zsh",
+}
+
+SHELL_CONTROL_RE = re.compile(r"[\n|;&<>`$()]")
+SED_RANGE_RE = re.compile(r"^([0-9]+)(?:,([0-9]+))?p$")
+SYMBOL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*$")
+ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+SOURCE_SHEBANG_RE = re.compile(
+    rb"^#!.*\b(bash|deno|fish|node|perl|php|python|python3|ruby|sh|zsh)\b"
+)
+
+
+def main() -> int:
+    if any(enabled(os.environ.get(name)) for name in BYPASS_ENV):
+        return 0
+
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return 0
+
+    if payload.get("hook_event_name") != "PreToolUse" or payload.get("tool_name") != "Bash":
+        return 0
+
+    command = payload.get("tool_input", {}).get("command")
+    if not isinstance(command, str) or not command.strip():
+        return 0
+
+    if SHELL_CONTROL_RE.search(command):
+        return 0
+
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return 0
+    if not tokens or command_has_bypass_prefix(tokens):
+        return 0
+
+    tokens = strip_env_prefix(tokens)
+    if not tokens:
+        return 0
+
+    cwd = Path(payload.get("cwd") or os.getcwd())
+    if not cwd.is_absolute():
+        cwd = Path(os.getcwd())
+    try:
+        cwd = cwd.resolve()
+    except OSError:
+        cwd = Path(os.getcwd()).resolve()
+
+    pitlane_base = resolve_pitlane_base()
+    if not pitlane_base:
+        return 0
+
+    plan = build_plan(tokens, cwd, pitlane_base)
+    if plan is None:
+        return 0
+
+    output = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "updatedInput": {"command": shell_join(plan.command)},
+        }
+    }
+    if plan.context:
+        output["hookSpecificOutput"]["additionalContext"] = plan.context
+    print(json.dumps(output, separators=(",", ":")))
+    return 0
+
+
+class RewritePlan:
+    def __init__(self, command: list[str], context: str | None = None) -> None:
+        self.command = command
+        self.context = context
+
+
+def enabled(value: str | None) -> bool:
+    return value is not None and value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def command_has_bypass_prefix(tokens: list[str]) -> bool:
+    for token in tokens[:6]:
+        if token in {"--", "sudo"}:
+            continue
+        if token == "env":
+            continue
+        if token in {"-i", "-0"} or token.startswith("-u"):
+            continue
+        if "=" not in token:
+            return False
+        name, value = token.split("=", 1)
+        if name in BYPASS_ENV and enabled(value):
+            return True
+    return False
+
+
+def strip_env_prefix(tokens: list[str]) -> list[str]:
+    idx = 0
+    while idx < len(tokens) and ASSIGNMENT_RE.match(tokens[idx]):
+        idx += 1
+    if idx:
+        return tokens[idx:]
+
+    if tokens and tokens[0] == "env":
+        idx = 1
+        while idx < len(tokens):
+            token = tokens[idx]
+            if token == "--":
+                idx += 1
+                break
+            if token == "-i":
+                idx += 1
+                continue
+            if token == "-u":
+                idx += 2
+                continue
+            if token.startswith("-u") and len(token) > 2:
+                idx += 1
+                continue
+            if ASSIGNMENT_RE.match(token):
+                idx += 1
+                continue
+            break
+        return tokens[idx:]
+
+    return tokens
+
+
+def resolve_pitlane_base() -> list[str] | None:
+    override = os.environ.get("PITLANE_CODEX_COMMAND")
+    if override:
+        try:
+            parsed = shlex.split(override)
+        except ValueError:
+            return None
+        if is_host_local_pitlane_command(parsed):
+            return parsed
+        return None
+
+    if shutil.which("pitlane"):
+        return ["pitlane"]
+
+    return None
+
+
+def is_host_local_pitlane_command(command: list[str]) -> bool:
+    if not command:
+        return False
+    executable = Path(command[0])
+    if executable.name != "pitlane":
+        return False
+    if not executable.is_absolute():
+        return command[0] == "pitlane" and shutil.which("pitlane") is not None
+    try:
+        resolved = executable.resolve(strict=True)
+    except OSError:
+        return False
+    return resolved.is_file() and os.access(resolved, os.X_OK)
+
+
+def build_plan(tokens: list[str], cwd: Path, pitlane_base: list[str]) -> RewritePlan | None:
+    executable = Path(tokens[0]).name
+    max_lines = int_env("PITLANE_CODEX_LINES_MAX", 220, 20, 1000)
+    search_limit = int_env("PITLANE_CODEX_SEARCH_LIMIT", 30, 5, 100)
+
+    if executable == "cat" and len(tokens) == 2 and not tokens[1].startswith("-"):
+        return plan_file_lines(pitlane_base, cwd, tokens[1], 1, max_lines, max_lines)
+
+    if executable == "head":
+        parsed = parse_head(tokens)
+        if parsed is not None:
+            count, path_arg = parsed
+            return plan_file_lines(pitlane_base, cwd, path_arg, 1, min(count, max_lines), max_lines)
+
+    if executable == "sed":
+        parsed = parse_sed_range(tokens)
+        if parsed is not None:
+            start, end, path_arg = parsed
+            if end < start:
+                return None
+            capped_end = min(end, start + max_lines - 1)
+            return plan_file_lines(pitlane_base, cwd, path_arg, start, capped_end, max_lines)
+
+    if executable == "rg":
+        parsed = parse_rg_symbol_search(tokens)
+        if parsed is not None:
+            query, file_filter = parsed
+            project = git_root(cwd)
+            if not pitlane_index_ready(pitlane_base, project):
+                return None
+            command = [*pitlane_base, "search", str(project), query, "--limit", str(search_limit), "--mode", "fuzzy"]
+            if file_filter:
+                command.extend(["--file", file_filter])
+            return RewritePlan(command, "Pitlane hook rewrote a simple symbol search to Pitlane search.")
+
+    if executable == "grep":
+        parsed = parse_grep_recursive_symbol_search(tokens)
+        if parsed is not None:
+            query, file_filter = parsed
+            project = git_root(cwd)
+            if not pitlane_index_ready(pitlane_base, project):
+                return None
+            command = [*pitlane_base, "search", str(project), query, "--limit", str(search_limit), "--mode", "fuzzy"]
+            if file_filter:
+                command.extend(["--file", file_filter])
+            return RewritePlan(command, "Pitlane hook rewrote a recursive symbol grep to Pitlane search.")
+
+    if executable in {"ls", "tree"}:
+        parsed = parse_recursive_listing(tokens)
+        if parsed is not None:
+            path_arg = parsed
+            path = resolve_existing_path(cwd, path_arg)
+            if path is None:
+                return None
+            project = git_root(path if path.is_dir() else path.parent)
+            if not pitlane_index_ready(pitlane_base, project):
+                return None
+            rel = relative_to_project(path, project)
+            command = [*pitlane_base, "outline", str(project), "--depth", "2", "--summary"]
+            if rel not in {"", "."}:
+                command.extend(["--path", rel])
+            return RewritePlan(command, "Pitlane hook rewrote a recursive listing to Pitlane outline.")
+
+    return None
+
+
+def plan_file_lines(
+    pitlane_base: list[str],
+    cwd: Path,
+    path_arg: str,
+    start: int,
+    end: int,
+    max_lines: int,
+) -> RewritePlan | None:
+    path = resolve_source_file(cwd, path_arg)
+    if path is None:
+        return None
+
+    project = git_root(path.parent)
+    rel = relative_to_project(path, project)
+    total = count_text_lines(path, max_lines + 1)
+    if total is None:
+        return None
+
+    if start == 1:
+        end = min(end, total)
+    if end < start:
+        return None
+
+    command = [*pitlane_base, "lines", str(project), rel, str(start), str(end)]
+    context = (
+        "Pitlane hook rewrote a broad source read to Pitlane lines. "
+        "Ask for narrower line ranges or Pitlane symbol/search tools when more context is needed."
+    )
+    return RewritePlan(command, context)
+
+
+def parse_head(tokens: list[str]) -> tuple[int, str] | None:
+    if len(tokens) == 2:
+        return 10, tokens[1]
+    if len(tokens) == 4 and tokens[1] == "-n" and tokens[2].isdigit():
+        return int(tokens[2]), tokens[3]
+    if len(tokens) == 3 and tokens[1].startswith("-n") and tokens[1][2:].isdigit():
+        return int(tokens[1][2:]), tokens[2]
+    return None
+
+
+def parse_sed_range(tokens: list[str]) -> tuple[int, int, str] | None:
+    if len(tokens) != 4 or tokens[1] != "-n":
+        return None
+    match = SED_RANGE_RE.match(tokens[2])
+    if not match:
+        return None
+    start = int(match.group(1))
+    end = int(match.group(2) or match.group(1))
+    return start, end, tokens[3]
+
+
+def parse_rg_symbol_search(tokens: list[str]) -> tuple[str, str | None] | None:
+    if len(tokens) not in {2, 3}:
+        return None
+    if any(token.startswith("-") for token in tokens[1:]):
+        return None
+    query = tokens[1]
+    if not SYMBOL_RE.match(query):
+        return None
+    file_filter = None
+    if len(tokens) == 3 and tokens[2] not in {".", "./"}:
+        if "*" in tokens[2] or "?" in tokens[2] or "[" in tokens[2]:
+            return None
+        file_filter = tokens[2].rstrip("/")
+    return query, file_filter
+
+
+def parse_grep_recursive_symbol_search(tokens: list[str]) -> tuple[str, str | None] | None:
+    if len(tokens) not in {3, 4}:
+        return None
+    flags = tokens[1]
+    if flags not in {"-R", "-r", "--recursive"}:
+        return None
+    query = tokens[2]
+    if not SYMBOL_RE.match(query):
+        return None
+    file_filter = tokens[3].rstrip("/") if len(tokens) == 4 and tokens[3] not in {".", "./"} else None
+    return query, file_filter
+
+
+def parse_recursive_listing(tokens: list[str]) -> str | None:
+    if tokens[0] == "tree":
+        if len(tokens) == 1:
+            return "."
+        if len(tokens) == 2 and not tokens[1].startswith("-"):
+            return tokens[1]
+        return None
+    if tokens[0] != "ls":
+        return None
+    if len(tokens) == 2 and tokens[1] in {"-R", "-lR", "-laR", "-Ral", "-Rla"}:
+        return "."
+    if len(tokens) == 3 and tokens[1] in {"-R", "-lR", "-laR", "-Ral", "-Rla"}:
+        return tokens[2]
+    return None
+
+
+def resolve_source_file(cwd: Path, path_arg: str) -> Path | None:
+    path = resolve_existing_path(cwd, path_arg)
+    if path is None or not path.is_file() or path.is_symlink():
+        return None
+    if path.suffix.lower() in SOURCE_EXTS:
+        return path
+    if path.suffix or not os.access(path, os.X_OK) or not has_source_shebang(path):
+        return None
+    return path
+
+
+def has_source_shebang(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            first_line = handle.readline(256)
+    except OSError:
+        return False
+    return bool(SOURCE_SHEBANG_RE.match(first_line))
+
+
+def resolve_existing_path(cwd: Path, path_arg: str) -> Path | None:
+    if any(marker in path_arg for marker in ["*", "?", "["]):
+        return None
+    path = Path(path_arg)
+    if not path.is_absolute():
+        path = cwd / path
+    try:
+        return path.resolve(strict=True)
+    except OSError:
+        return None
+
+
+def git_root(start: Path) -> Path:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(start), "rev-parse", "--show-toplevel"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=1.0,
+        )
+        if result.returncode == 0:
+            root = Path(result.stdout.strip())
+            if root.is_absolute() and root.exists():
+                return root.resolve()
+    except Exception:
+        pass
+    return start.resolve() if start.is_dir() else start.parent.resolve()
+
+
+def relative_to_project(path: Path, project: Path) -> str:
+    try:
+        return path.relative_to(project).as_posix()
+    except ValueError:
+        return path.name
+
+
+def count_text_lines(path: Path, max_lines: int) -> int | None:
+    try:
+        with path.open("rb") as handle:
+            first = handle.read(8192)
+            if b"\0" in first:
+                return None
+            lines = first.count(b"\n")
+            saw_bytes = bool(first)
+            last_byte = first[-1:] if first else b""
+            while lines <= max_lines:
+                chunk = handle.read(65536)
+                if not chunk:
+                    break
+                if b"\0" in chunk:
+                    return None
+                saw_bytes = True
+                last_byte = chunk[-1:]
+                lines += chunk.count(b"\n")
+    except OSError:
+        return None
+    if saw_bytes and last_byte != b"\n":
+        lines += 1
+    return max(1, lines)
+
+
+def pitlane_index_ready(pitlane_base: list[str], project: Path) -> bool:
+    if enabled(os.environ.get("PITLANE_CODEX_ASSUME_INDEXED")):
+        return True
+    try:
+        result = subprocess.run(
+            [*pitlane_base, "stats", str(project)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=2.0,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
+
+
+def int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, ""))
+    except ValueError:
+        value = default
+    return min(max(value, minimum), maximum)
+
+
+def shell_join(tokens: list[str]) -> str:
+    return " ".join(shlex.quote(token) for token in tokens)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
