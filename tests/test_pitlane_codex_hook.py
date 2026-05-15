@@ -40,10 +40,18 @@ class PitlaneCodexHookTest(unittest.TestCase):
         cwd: Path,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        fake_bin = cwd / ".test-bin"
+        fake_bin.mkdir(exist_ok=True)
+        fake_pitlane = fake_bin / "pitlane"
+        if not fake_pitlane.exists():
+            fake_pitlane.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf8")
+            fake_pitlane.chmod(fake_pitlane.stat().st_mode | stat.S_IXUSR)
+
         process_env = {
             **os.environ,
             "PITLANE_CODEX_COMMAND": "pitlane",
             "PITLANE_CODEX_ASSUME_INDEXED": "1",
+            "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
         }
         for name in BYPASS_ENV:
             process_env.pop(name, None)
