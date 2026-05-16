@@ -39,6 +39,15 @@ def payload(
 
 
 class PitlaneCodexHookTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._pitlane_bin_dir = tempfile.TemporaryDirectory()
+        self.fake_pitlane = Path(self._pitlane_bin_dir.name) / "pitlane"
+        self.fake_pitlane.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf8")
+        self.fake_pitlane.chmod(self.fake_pitlane.stat().st_mode | stat.S_IXUSR)
+
+    def tearDown(self) -> None:
+        self._pitlane_bin_dir.cleanup()
+
     def run_hook(
         self,
         command: str,
@@ -51,6 +60,7 @@ class PitlaneCodexHookTest(unittest.TestCase):
             "PITLANE_CODEX_COMMAND": "pitlane",
             "PITLANE_CODEX_ASSUME_INDEXED": "1",
             "PITLANE_CODEX_TELEMETRY": "0",
+            "PATH": f"{self._pitlane_bin_dir.name}{os.pathsep}{os.environ.get('PATH', '')}",
         }
         for name in BYPASS_ENV:
             process_env.pop(name, None)
@@ -134,6 +144,7 @@ class PitlaneCodexHookTest(unittest.TestCase):
                 **os.environ,
                 "PITLANE_CODEX_COMMAND": "pitlane",
                 "PITLANE_CODEX_ASSUME_INDEXED": "1",
+                "PATH": f"{self._pitlane_bin_dir.name}{os.pathsep}{os.environ.get('PATH', '')}",
             }
 
             result = subprocess.run(
