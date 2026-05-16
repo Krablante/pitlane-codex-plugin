@@ -18,8 +18,8 @@ Known integration layers:
   support plugin-loaded `PreToolUse` shell hooks.
 - Telegram or remote-worker gateways can install or sync the plugin for worker
   machines, but no gateway is required for local usage. Teledex is the planned
-  Telegram gateway layer and is intentionally not linked until it has a public
-  release.
+  Telegram gateway layer; its planned public repo name is `Krablante/teledex`,
+  and it is intentionally not linked until that repo exists.
 
 Pitlane rewrites require a host-local `pitlane` binary in `PATH`. Symbol search
 and recursive listing rewrites also require a ready Pitlane project index.
@@ -40,3 +40,9 @@ The hook avoids rewriting commands where exact output is expected:
 
 When the hook cannot prove a command is safe to rewrite, it emits no hook output
 and the runtime executes the original shell command unchanged.
+
+## Dependency Boundary
+
+Pitlane Codex Plugin does not require Teledex. It only requires a
+Codex-compatible runtime that supports plugin-loaded `PreToolUse` shell hooks
+and a host-local `pitlane` CLI for rewrites.

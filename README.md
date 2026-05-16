@@ -9,17 +9,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Krablante/pitlane-codex-plugin/actions/workflows/ci.yml">
-    <img src="https://img.shields.io/github/actions/workflow/status/Krablante/pitlane-codex-plugin/ci.yml?branch=main&style=for-the-badge" alt="CI status">
-  </a>
-  <a href="./LICENSE">
-    <img src="https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge" alt="MIT License">
-  </a>
-  <img src="https://img.shields.io/badge/Python-3-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3">
-  <img src="https://img.shields.io/badge/Codex-Plugin%20Hooks-111111?style=for-the-badge" alt="Codex plugin hooks">
-</p>
-
-<p align="center">
   <a href="./docs/install.md">Install</a>
   ·
   <a href="./docs/compatibility.md">Compatibility</a>
@@ -42,11 +31,21 @@ There is no sidecar, container, SSH, wrapper, or gateway fallback path. If a
 host-local `pitlane` executable is not available, the hook silently leaves the
 original shell command alone.
 
-Stack note: [Codez](https://github.com/Krablante/codez) is the recommended
-public runtime layer for working plugin-hook compatibility and token-aware
-context behavior. [RTK Codex Plugin](https://github.com/Krablante/rtk-codex-plugin)
-can run before Pitlane to guard risky shell output. A Telegram gateway layer,
-Teledex, is planned later and is not linked until it has a clean public release.
+## Part of the Codez stack
+
+The Codez stack is modular. Each layer can be used on its own unless a higher
+layer explicitly opts into it.
+
+| Layer | Public surface | Responsibility | Dependency |
+| --- | --- | --- | --- |
+| [Codez](https://github.com/Krablante/codez) | Codex-compatible runtime | App Server v2, goal RPC, long-session hardening, prompt pruning, and plugin hooks | Does not require Teledex |
+| [RTK Codex Plugin](https://github.com/Krablante/rtk-codex-plugin) | Optional Codex plugin | Shell/token safety through `rtk rewrite` and bounded output guarding | Requires a Codex-compatible plugin-hook runtime; does not require Teledex |
+| [Pitlane Codex Plugin](https://github.com/Krablante/pitlane-codex-plugin) | Optional Codex plugin | Code-navigation/token-saving rewrites through a host-local `pitlane` CLI | Requires a Codex-compatible plugin-hook runtime and local `pitlane`; does not require Teledex |
+| Teledex (planned public repo: `Krablante/teledex`) | Telegram gateway/session layer | Topics, queues, live steer, `/goal` UX, and multi-host delivery/recovery | Basic mode can drive upstream Codex; full mode requires a Codez-compatible runtime with App Server v2 and plugin-hook support |
+
+When RTK and Pitlane are both enabled, load RTK before Pitlane. RTK handles
+general shell-output safety; Pitlane then wins only for the narrow
+code-navigation commands it accepts.
 
 ## Why People Use It
 
@@ -55,33 +54,6 @@ Teledex, is planned later and is not linked until it has a clean public release.
 - turn simple symbol and listing exploration into indexed Pitlane navigation
 - keep exact output intact for tests, builds, JSON, Docker, SSH, and automation
 - install as a small plugin instead of changing shell habits by hand
-
-## Mental Model
-
-| Piece | Role |
-| --- | --- |
-| Codex-compatible runtime | executes `PreToolUse` hooks before shell calls |
-| `pitlane-codex-hook` | decides whether a source-navigation command can be rewritten |
-| host-local `pitlane` CLI | serves lines, search results, and outlines from a local project index |
-| optional RTK plugin | runs earlier in the stack for shell token-safety and output guarding |
-
-Architecture at a glance:
-
-```text
-Codex shell tool call
-  -> PreToolUse hooks
-     -> RTK can guard risky shell output
-     -> Pitlane can rewrite narrow code-navigation commands
-     -> exact-output/build/test/Docker/SSH/control command? pass through unchanged
-```
-
-## Highlights
-
-- standalone hook: only depends on a host-local `pitlane` CLI
-- index-aware symbol/listing rewrites
-- bounded source-line reads for common code browsing commands
-- conservative pass-through policy for commands where stdout semantics matter
-- designed to fit the Codez + RTK + Pitlane + future Teledex stack
 
 ## Quick Start
 

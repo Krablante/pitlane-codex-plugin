@@ -39,4 +39,5 @@ pitlane index /path/to/project
 ```
 
 The hook does not start, contact, or fall back to any gateway, container,
-remote host, or sidecar process.
+remote host, or sidecar process. No Teledex install is required for local
+plugin usage.
