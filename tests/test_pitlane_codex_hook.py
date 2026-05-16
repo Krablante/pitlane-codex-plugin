@@ -21,13 +21,19 @@ BYPASS_ENV = [
 ]
 
 
-def payload(command: str, cwd: Path) -> str:
+def payload(
+    command: str,
+    cwd: Path,
+    *,
+    input_key: str = "command",
+    tool_name: str = "Bash",
+) -> str:
     return json.dumps(
         {
             "hook_event_name": "PreToolUse",
-            "tool_name": "Bash",
+            "tool_name": tool_name,
             "cwd": str(cwd),
-            "tool_input": {"command": command},
+            "tool_input": {input_key: command},
         }
     )
 
@@ -40,18 +46,11 @@ class PitlaneCodexHookTest(unittest.TestCase):
         cwd: Path,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        fake_bin = cwd / ".test-bin"
-        fake_bin.mkdir(exist_ok=True)
-        fake_pitlane = fake_bin / "pitlane"
-        if not fake_pitlane.exists():
-            fake_pitlane.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf8")
-            fake_pitlane.chmod(fake_pitlane.stat().st_mode | stat.S_IXUSR)
-
         process_env = {
             **os.environ,
             "PITLANE_CODEX_COMMAND": "pitlane",
             "PITLANE_CODEX_ASSUME_INDEXED": "1",
-            "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+            "PITLANE_CODEX_TELEMETRY": "0",
         }
         for name in BYPASS_ENV:
             process_env.pop(name, None)
@@ -78,6 +77,11 @@ class PitlaneCodexHookTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stderr, "")
         return json.loads(result.stdout)["hookSpecificOutput"]["updatedInput"]["command"]
+
+    def hook_output(self, result: subprocess.CompletedProcess[str]) -> dict:
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "")
+        return json.loads(result.stdout)["hookSpecificOutput"]
 
     def test_rewrites_cat_source_file_to_pitlane_lines(self) -> None:
         with project_dir() as root:
@@ -121,6 +125,40 @@ class PitlaneCodexHookTest(unittest.TestCase):
                     result = self.run_hook(command, cwd=root)
                     self.assertEqual(self.rewritten_command(result), expected)
 
+    def test_adapts_exec_command_cmd_shape_and_safe_shell_unwrap(self) -> None:
+        with project_dir() as root:
+            source = root / "src" / "app.py"
+            source.parent.mkdir()
+            source.write_text("print('one')\nprint('two')\n", encoding="utf8")
+            process_env = {
+                **os.environ,
+                "PITLANE_CODEX_COMMAND": "pitlane",
+                "PITLANE_CODEX_ASSUME_INDEXED": "1",
+            }
+
+            result = subprocess.run(
+                [str(HOOK)],
+                input=payload(
+                    "bash -lc 'cat src/app.py'",
+                    root,
+                    input_key="cmd",
+                    tool_name="exec_command",
+                ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                env=process_env,
+                timeout=5,
+            )
+
+        output = self.hook_output(result)
+        self.assertEqual(set(output["updatedInput"]), {"cmd"})
+        self.assertEqual(
+            output["updatedInput"]["cmd"],
+            "pitlane lines PROJECT src/app.py 1 2".replace("PROJECT", str(root)),
+        )
+
     def test_rewrites_extensionless_executable_shebang_source(self) -> None:
         with project_dir() as root:
             source = root / "hooks" / "pitlane-codex-hook"
@@ -163,20 +201,60 @@ class PitlaneCodexHookTest(unittest.TestCase):
             for command in [
                 "cat README.md",
                 "cat data.json",
-                "cat src/app.py | head -n 20",
                 "rg --files",
                 "rg --json needle",
                 "rg -l needle .",
+                "rg TODO src",
+                "rg FIXME src",
+                "rg class src",
+                "rg return src",
+                "rg import src",
+                "rg parse_rg_symbol_search hooks",
+                "rg CommandRunner dist",
+                "rg CommandRunner generated",
                 "rg foo.bar src",
                 "rg foo-bar src",
                 "grep -c needle src/app.py",
+                "grep -R TODO src",
+                "grep -R FIXME src",
+                "grep -R class src",
+                "grep -R import src",
+                "grep -R parse_rg_symbol_search hooks",
+                "grep -R CommandRunner data",
+                "grep -R CommandRunner generated",
                 "grep -R foo.bar src",
                 "grep -R foo-bar src",
                 "git status --short",
                 "make test",
                 "pytest -q",
                 "docker ps",
-                "ssh toma hostname",
+                "ssh example-host hostname",
+            ]:
+                with self.subTest(command=command):
+                    result = self.run_hook(command, cwd=root)
+                    self.assert_no_output(result)
+
+    def test_shell_control_source_navigation_stays_quiet(self) -> None:
+        with project_dir() as root:
+            source = root / "src" / "app.py"
+            source.parent.mkdir()
+            source.write_text("print('x')\n", encoding="utf8")
+
+            result = self.run_hook("cat src/app.py | head -n 20", cwd=root)
+
+        self.assert_no_output(result)
+
+    def test_shell_control_literal_search_does_not_emit_source_navigation_hint(self) -> None:
+        with project_dir() as root:
+            (root / "src").mkdir()
+            (root / "src" / "app.py").write_text("print('x')\n", encoding="utf8")
+
+            for command in [
+                "rg TODO src | head -20",
+                "grep -R TODO src | wc -l",
+                "rg CommandRunner src | head -20",
+                "cat /tmp/runtime-state/session.py | head -20",
+                "cat src/app.py > /tmp/pitlane-out.txt",
             ]:
                 with self.subTest(command=command):
                     result = self.run_hook(command, cwd=root)
@@ -211,9 +289,169 @@ class PitlaneCodexHookTest(unittest.TestCase):
                 },
             )
 
-        self.assert_no_output(result)
+        output = self.hook_output(result)
+        self.assertNotIn("updatedInput", output)
+        self.assertIn("missed source-navigation opportunity", output["additionalContext"])
 
-    def test_missing_pitlane_cli_does_not_try_container_fallback(self) -> None:
+    def test_missed_opportunity_telemetry_uses_hash_not_command_by_default(self) -> None:
+        with project_dir() as root, tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "pitlane"
+            fake.write_text("#!/usr/bin/env sh\nexit 1\n", encoding="utf8")
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            telemetry = Path(tmp) / "telemetry.jsonl"
+
+            result = self.run_hook(
+                "rg SecretToken src",
+                cwd=root,
+                env={
+                    "PITLANE_CODEX_COMMAND": str(fake),
+                    "PITLANE_CODEX_ASSUME_INDEXED": "0",
+                    "PITLANE_CODEX_TELEMETRY": "1",
+                    "PITLANE_CODEX_TELEMETRY_PATH": str(telemetry),
+                },
+            )
+            records = [json.loads(line) for line in telemetry.read_text(encoding="utf8").splitlines()]
+
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(any(record["event"] == "missed_opportunity" for record in records))
+        self.assertTrue(all(record.get("command_preview") is None for record in records))
+        self.assertTrue(any(record.get("command_hash") for record in records))
+
+    def test_missed_opportunity_telemetry_is_opt_in(self) -> None:
+        with project_dir() as root, tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "pitlane"
+            fake.write_text("#!/usr/bin/env sh\nexit 1\n", encoding="utf8")
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            telemetry = Path(tmp) / "telemetry.jsonl"
+
+            result = self.run_hook(
+                "rg SecretToken src",
+                cwd=root,
+                env={
+                    "PITLANE_CODEX_COMMAND": str(fake),
+                    "PITLANE_CODEX_ASSUME_INDEXED": "0",
+                    "PITLANE_CODEX_TELEMETRY": "",
+                    "PITLANE_CODEX_TELEMETRY_PATH": str(telemetry),
+                },
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(telemetry.exists())
+
+    def test_decision_telemetry_is_compact_and_opt_in(self) -> None:
+        with project_dir() as root, tempfile.TemporaryDirectory() as tmp:
+            (root / "src").mkdir()
+            telemetry = Path(tmp) / "telemetry.jsonl"
+            env = {
+                "PITLANE_CODEX_TELEMETRY": "1",
+                "PITLANE_CODEX_TELEMETRY_DECISIONS": "1",
+                "PITLANE_CODEX_TELEMETRY_PATH": str(telemetry),
+            }
+
+            literal = self.run_hook("rg TODO src", cwd=root, env=env)
+            rewrite = self.run_hook("rg CommandRunner src", cwd=root, env=env)
+            records = [json.loads(line) for line in telemetry.read_text(encoding="utf8").splitlines()]
+
+        self.assert_no_output(literal)
+        self.assertIn("updatedInput", self.hook_output(rewrite))
+        decisions = [record for record in records if record["event"] == "decision"]
+        self.assertTrue(any(
+            record.get("decision") == "pass" and record.get("command_class") == "literal-search"
+            for record in decisions
+        ))
+        self.assertTrue(any(
+            record.get("decision") == "rewrite" and record.get("command_class") == "symbol-search"
+            for record in decisions
+        ))
+        self.assertTrue(all(record.get("command_preview") is None for record in decisions))
+
+    def test_missed_opportunity_telemetry_covers_find_and_git_grep(self) -> None:
+        with project_dir() as root, tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "pitlane"
+            fake.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf8")
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            telemetry = Path(tmp) / "telemetry.jsonl"
+
+            for command in ["find . -name '*.py'", "git grep CommandRunner"]:
+                result = self.run_hook(
+                    command,
+                    cwd=root,
+                    env={
+                        "PITLANE_CODEX_COMMAND": str(fake),
+                        "PITLANE_CODEX_ASSUME_INDEXED": "1",
+                        "PITLANE_CODEX_TELEMETRY": "1",
+                        "PITLANE_CODEX_TELEMETRY_PATH": str(telemetry),
+                    },
+                )
+                output = self.hook_output(result)
+                self.assertNotIn("updatedInput", output)
+                self.assertIn("missed source-navigation opportunity", output["additionalContext"])
+
+            records = [json.loads(line) for line in telemetry.read_text(encoding="utf8").splitlines()]
+
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all(record["event"] == "missed_opportunity" for record in records))
+        self.assertTrue(all(record.get("command_hash") for record in records))
+
+    def test_excluded_scopes_are_not_counted_as_missed_navigation(self) -> None:
+        with project_dir() as root, tempfile.TemporaryDirectory() as tmp:
+            (root / "generated").mkdir()
+            (root / "generated" / "Thing.py").write_text("class CommandRunner: pass\n", encoding="utf8")
+            (root / "log").mkdir()
+            (root / "log" / "event.py").write_text("class CommandRunner: pass\n", encoding="utf8")
+            runtime_state = root / "runtime-state"
+            runtime_state.mkdir()
+            (runtime_state / "session.py").write_text("class CommandRunner: pass\n", encoding="utf8")
+            nested = root / "nested"
+            nested.mkdir()
+            telemetry = Path(tmp) / "telemetry.jsonl"
+            env = {
+                "PITLANE_CODEX_TELEMETRY": "1",
+                "PITLANE_CODEX_TELEMETRY_PATH": str(telemetry),
+            }
+            for command in [
+                "find /tmp/runtime-state -name '*.py'",
+                "ls -R dist",
+                "ls -R generated",
+                "find generated -name '*.py'",
+                "cat generated/Thing.py",
+                "cat /tmp/runtime-state/session.py",
+                "cat runtime-state/session.py",
+                "cat log/event.py",
+                "find log -name '*.py'",
+            ]:
+                with self.subTest(command=command):
+                    result = self.run_hook(command, cwd=root, env=env)
+                    self.assert_no_output(result)
+
+            result = self.run_hook("cat ../runtime-state/session.py", cwd=nested, env=env)
+            self.assert_no_output(result)
+
+        self.assertFalse(telemetry.exists())
+
+    def test_excluded_scope_cwd_is_not_source_navigation(self) -> None:
+        for scope in ["runtime-state", "log", "generated", "data", "archive", "state"]:
+            with self.subTest(scope=scope), project_dir() as root, tempfile.TemporaryDirectory() as tmp:
+                scope_dir = root / scope
+                scope_dir.mkdir()
+                (scope_dir / "session.py").write_text("class CommandRunner: pass\n", encoding="utf8")
+                telemetry = Path(tmp) / "telemetry.jsonl"
+                env = {
+                    "PITLANE_CODEX_TELEMETRY": "1",
+                    "PITLANE_CODEX_TELEMETRY_PATH": str(telemetry),
+                }
+                for command in [
+                    "cat session.py",
+                    "find . -name '*.py'",
+                    "rg CommandRunner .",
+                    "grep -R CommandRunner .",
+                    "git grep CommandRunner",
+                ]:
+                    result = self.run_hook(command, cwd=scope_dir, env=env)
+                    self.assert_no_output(result)
+                self.assertFalse(telemetry.exists())
+
+    def test_missing_pitlane_cli_does_not_fallback_to_docker_mcp(self) -> None:
         with project_dir() as root, tempfile.TemporaryDirectory() as tmp:
             source = root / "src" / "app.py"
             source.parent.mkdir()
@@ -233,7 +471,7 @@ class PitlaneCodexHookTest(unittest.TestCase):
 
         self.assert_no_output(result)
 
-    def test_rejects_container_pitlane_command_override(self) -> None:
+    def test_rejects_docker_pitlane_command_override(self) -> None:
         with project_dir() as root:
             source = root / "src" / "app.py"
             source.parent.mkdir()
@@ -242,7 +480,7 @@ class PitlaneCodexHookTest(unittest.TestCase):
             result = self.run_hook(
                 "cat src/app.py",
                 cwd=root,
-                env={"PITLANE_CODEX_COMMAND": " ".join(["docker", "exec", "pitlane-cli", "pitlane"])},
+                env={"PITLANE_CODEX_COMMAND": "docker exec pitlane-cli pitlane"},
             )
 
         self.assert_no_output(result)

@@ -13,12 +13,16 @@ navigation reads token-efficient by rewriting safe cases to Pitlane CLI calls.
 - Source `cat`, `head`, and simple `sed -n A,Bp` reads become
   `pitlane lines`.
 - Simple symbol-looking `rg`, recursive `grep`, and recursive listings become
-  Pitlane search/outline only when the project already has a Pitlane index.
+  Pitlane search/outline when the project has a Pitlane index; trusted
+  worktrees may be auto-indexed with a short timeout.
+- Missed source-navigation opportunities, including broad `find` and
+  `git grep` shapes, can emit a short `additionalContext` hint while leaving
+  the original command unchanged. Compact telemetry is opt-in via
+  `PITLANE_CODEX_TELEMETRY=1`.
 - Exact-output, machine-readable, build, test, data, Docker, SSH, and shell
   control commands pass through.
-- The hook is intentionally separate from the RTK hook. When both are enabled,
-  configure RTK first and Pitlane after it, so Pitlane rewrites win only for
-  the narrow code-navigation cases it accepts.
+- The hook is intentionally separate from the RTK hook. Install it after RTK so
+  Pitlane rewrites win only for the narrow code-navigation cases it accepts.
 
 ## Bypass
 

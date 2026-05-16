@@ -22,8 +22,11 @@ host-local `pitlane` CLI calls:
 
 - source `cat`, `head`, and simple `sed -n A,Bp` reads become `pitlane lines`;
 - simple symbol-looking `rg`, recursive `grep`, `ls -R`, and `tree` commands
-  become Pitlane search or outline calls when the project already has a Pitlane
-  index;
+  become Pitlane search or outline calls when the project has a Pitlane index,
+  with a cheap auto-index attempt for safe local worktrees;
+- missed source-navigation opportunities, including broad `find` and
+  `git grep` shapes, can emit a small hint while leaving the original command
+  unchanged; compact telemetry for these misses is opt-in;
 - exact-output, regex-like search, machine-readable, build, test, Docker, SSH,
   data, and shell-control commands pass through unchanged.
 
@@ -94,6 +97,7 @@ Read next:
 ## Notes
 
 - `pitlane` is required for rewrites; without it, the hook passes through.
-- symbol and outline rewrites require an existing Pitlane index.
+- symbol and outline rewrites require a ready Pitlane index; safe local
+  worktrees can be auto-indexed with a short timeout.
 - the plugin is intentionally shell-hook-only; gateway/session behavior belongs
   in higher-level tools.

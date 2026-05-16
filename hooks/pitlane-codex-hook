@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import datetime as _dt
 from pathlib import Path
 
 
@@ -66,10 +68,32 @@ SOURCE_EXTS = {
 SHELL_CONTROL_RE = re.compile(r"[\n|;&<>`$()]")
 SED_RANGE_RE = re.compile(r"^([0-9]+)(?:,([0-9]+))?p$")
 SYMBOL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*$")
+STRONG_SYMBOL_RE = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Z][A-Za-z0-9_]*[a-z][A-Za-z0-9_]*$")
 ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 SOURCE_SHEBANG_RE = re.compile(
     rb"^#!.*\b(bash|deno|fish|node|perl|php|python|python3|ruby|sh|zsh)\b"
 )
+SHELL_RUNNERS = {"bash", "dash", "sh", "zsh"}
+SHELL_TOOL_NAMES = {"Bash", "exec_command", "functions.exec_command"}
+EXCLUDED_NAV_PATH_PARTS = {
+    ".cache",
+    ".git",
+    "__pycache__",
+    "archive",
+    "backups",
+    "build",
+    "data",
+    "dist",
+    "generated",
+    "log",
+    "logs",
+    "node_modules",
+    "runtime-state",
+    "state",
+    "target",
+    "tmp",
+}
+EXCLUDED_NAV_SUFFIXES = {".json", ".jsonl", ".log", ".ndjson"}
 
 
 def main() -> int:
@@ -81,14 +105,24 @@ def main() -> int:
     except Exception:
         return 0
 
-    if payload.get("hook_event_name") != "PreToolUse" or payload.get("tool_name") != "Bash":
+    if payload.get("hook_event_name") != "PreToolUse" or not is_shell_tool(payload):
         return 0
 
-    command = payload.get("tool_input", {}).get("command")
+    original_command, command_field = command_from_payload(payload)
+    command = original_command
     if not isinstance(command, str) or not command.strip():
         return 0
+    command = safe_unwrap_shell_command(command)
+    cwd = cwd_from_payload(payload)
+    if not cwd.is_absolute():
+        cwd = Path(os.getcwd())
+    try:
+        cwd = cwd.resolve()
+    except OSError:
+        cwd = Path(os.getcwd()).resolve()
 
     if SHELL_CONTROL_RE.search(command):
+        record_decision(payload, command, "pass", "shell-control", "shell-control-quiet", cwd)
         return 0
 
     try:
@@ -102,26 +136,25 @@ def main() -> int:
     if not tokens:
         return 0
 
-    cwd = Path(payload.get("cwd") or os.getcwd())
-    if not cwd.is_absolute():
-        cwd = Path(os.getcwd())
-    try:
-        cwd = cwd.resolve()
-    except OSError:
-        cwd = Path(os.getcwd()).resolve()
-
     pitlane_base = resolve_pitlane_base()
     if not pitlane_base:
+        record_decision(payload, command, "unavailable", classify_tokens(tokens, cwd), "pitlane-cli-unavailable", cwd)
         return 0
 
-    plan = build_plan(tokens, cwd, pitlane_base)
+    plan = build_plan(tokens, cwd, pitlane_base, payload=payload, original_command=command)
     if plan is None:
+        if should_hint_tokens(tokens, cwd):
+            record_decision(payload, command, "hint", classify_tokens(tokens, cwd), "source-navigation-shell", cwd)
+            emit_missed_hint(original_command, command_field, "source navigation used shell before Pitlane")
+        else:
+            record_decision(payload, command, "pass", classify_tokens(tokens, cwd), "not-source-navigation", cwd)
         return 0
+    record_decision(payload, command, "rewrite", classify_tokens(tokens, cwd), "pitlane-plan", cwd)
 
     output = {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
-            "updatedInput": {"command": shell_join(plan.command)},
+            "updatedInput": {command_field: shell_join(plan.command)},
         }
     }
     if plan.context:
@@ -134,6 +167,48 @@ class RewritePlan:
     def __init__(self, command: list[str], context: str | None = None) -> None:
         self.command = command
         self.context = context
+
+
+def is_shell_tool(payload: dict) -> bool:
+    tool_name = payload.get("tool_name")
+    if not isinstance(tool_name, str):
+        return False
+    return tool_name in SHELL_TOOL_NAMES or tool_name.endswith(".exec_command")
+
+
+def command_from_payload(payload: dict) -> tuple[str, str]:
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return "", "command"
+    for key in ("command", "cmd"):
+        value = tool_input.get(key)
+        if isinstance(value, str):
+            return value, key
+    return "", "command"
+
+
+def safe_unwrap_shell_command(command: str) -> str:
+    try:
+        tokens = shlex.split(command.strip(), posix=True)
+    except ValueError:
+        return command
+    if len(tokens) != 3:
+        return command
+    runner = Path(tokens[0]).name
+    if runner not in SHELL_RUNNERS or tokens[1] not in {"-c", "-lc"}:
+        return command
+    inner = tokens[2].strip()
+    return inner or command
+
+
+def cwd_from_payload(payload: dict) -> Path:
+    cwd = Path(payload.get("cwd") or os.getcwd())
+    if not cwd.is_absolute():
+        cwd = Path(os.getcwd())
+    try:
+        return cwd.resolve()
+    except OSError:
+        return Path(os.getcwd()).resolve()
 
 
 def enabled(value: str | None) -> bool:
@@ -220,19 +295,34 @@ def is_host_local_pitlane_command(command: list[str]) -> bool:
     return resolved.is_file() and os.access(resolved, os.X_OK)
 
 
-def build_plan(tokens: list[str], cwd: Path, pitlane_base: list[str]) -> RewritePlan | None:
+def build_plan(
+    tokens: list[str],
+    cwd: Path,
+    pitlane_base: list[str],
+    *,
+    payload: dict | None = None,
+    original_command: str = "",
+) -> RewritePlan | None:
     executable = Path(tokens[0]).name
     max_lines = int_env("PITLANE_CODEX_LINES_MAX", 220, 20, 1000)
     search_limit = int_env("PITLANE_CODEX_SEARCH_LIMIT", 30, 5, 100)
 
     if executable == "cat" and len(tokens) == 2 and not tokens[1].startswith("-"):
-        return plan_file_lines(pitlane_base, cwd, tokens[1], 1, max_lines, max_lines)
+        return plan_file_lines(pitlane_base, cwd, tokens[1], 1, max_lines, max_lines, payload=payload)
 
     if executable == "head":
         parsed = parse_head(tokens)
         if parsed is not None:
             count, path_arg = parsed
-            return plan_file_lines(pitlane_base, cwd, path_arg, 1, min(count, max_lines), max_lines)
+            return plan_file_lines(
+                pitlane_base,
+                cwd,
+                path_arg,
+                1,
+                min(count, max_lines),
+                max_lines,
+                payload=payload,
+            )
 
     if executable == "sed":
         parsed = parse_sed_range(tokens)
@@ -241,14 +331,23 @@ def build_plan(tokens: list[str], cwd: Path, pitlane_base: list[str]) -> Rewrite
             if end < start:
                 return None
             capped_end = min(end, start + max_lines - 1)
-            return plan_file_lines(pitlane_base, cwd, path_arg, start, capped_end, max_lines)
+            return plan_file_lines(
+                pitlane_base,
+                cwd,
+                path_arg,
+                start,
+                capped_end,
+                max_lines,
+                payload=payload,
+            )
 
     if executable == "rg":
-        parsed = parse_rg_symbol_search(tokens)
+        parsed = parse_rg_symbol_search(tokens, cwd)
         if parsed is not None:
             query, file_filter = parsed
             project = git_root(cwd)
-            if not pitlane_index_ready(pitlane_base, project):
+            if not ensure_pitlane_index_ready(pitlane_base, project, payload=payload):
+                record_missed_opportunity(payload, original_command, "index-not-ready", cwd)
                 return None
             command = [*pitlane_base, "search", str(project), query, "--limit", str(search_limit), "--mode", "fuzzy"]
             if file_filter:
@@ -256,11 +355,12 @@ def build_plan(tokens: list[str], cwd: Path, pitlane_base: list[str]) -> Rewrite
             return RewritePlan(command, "Pitlane hook rewrote a simple symbol search to Pitlane search.")
 
     if executable == "grep":
-        parsed = parse_grep_recursive_symbol_search(tokens)
+        parsed = parse_grep_recursive_symbol_search(tokens, cwd)
         if parsed is not None:
             query, file_filter = parsed
             project = git_root(cwd)
-            if not pitlane_index_ready(pitlane_base, project):
+            if not ensure_pitlane_index_ready(pitlane_base, project, payload=payload):
+                record_missed_opportunity(payload, original_command, "index-not-ready", cwd)
                 return None
             command = [*pitlane_base, "search", str(project), query, "--limit", str(search_limit), "--mode", "fuzzy"]
             if file_filter:
@@ -268,14 +368,16 @@ def build_plan(tokens: list[str], cwd: Path, pitlane_base: list[str]) -> Rewrite
             return RewritePlan(command, "Pitlane hook rewrote a recursive symbol grep to Pitlane search.")
 
     if executable in {"ls", "tree"}:
-        parsed = parse_recursive_listing(tokens)
+        parsed = parse_recursive_listing(tokens, cwd)
         if parsed is not None:
             path_arg = parsed
             path = resolve_existing_path(cwd, path_arg)
             if path is None:
+                record_missed_opportunity(payload, original_command, "path-not-found", cwd)
                 return None
             project = git_root(path if path.is_dir() else path.parent)
-            if not pitlane_index_ready(pitlane_base, project):
+            if not ensure_pitlane_index_ready(pitlane_base, project, payload=payload):
+                record_missed_opportunity(payload, original_command, "index-not-ready", cwd)
                 return None
             rel = relative_to_project(path, project)
             command = [*pitlane_base, "outline", str(project), "--depth", "2", "--summary"]
@@ -283,6 +385,8 @@ def build_plan(tokens: list[str], cwd: Path, pitlane_base: list[str]) -> Rewrite
                 command.extend(["--path", rel])
             return RewritePlan(command, "Pitlane hook rewrote a recursive listing to Pitlane outline.")
 
+    if looks_like_source_navigation(tokens, cwd):
+        record_missed_opportunity(payload, original_command, "unsupported-source-navigation-shape", cwd)
     return None
 
 
@@ -293,12 +397,20 @@ def plan_file_lines(
     start: int,
     end: int,
     max_lines: int,
+    payload: dict | None = None,
 ) -> RewritePlan | None:
+    if path_arg_is_excluded_from_navigation(path_arg):
+        return None
+    resolved = resolve_existing_path(cwd, path_arg)
+    if resolved is not None and path_is_excluded_from_navigation(resolved):
+        return None
     path = resolve_source_file(cwd, path_arg)
     if path is None:
+        record_missed_opportunity(payload, f"source-read {path_arg}", "source-path-not-supported", cwd)
         return None
 
     project = git_root(path.parent)
+    ensure_pitlane_index_ready(pitlane_base, project, payload=payload, required=False)
     rel = relative_to_project(path, project)
     total = count_text_lines(path, max_lines + 1)
     if total is None:
@@ -338,40 +450,64 @@ def parse_sed_range(tokens: list[str]) -> tuple[int, int, str] | None:
     return start, end, tokens[3]
 
 
-def parse_rg_symbol_search(tokens: list[str]) -> tuple[str, str | None] | None:
+def parse_rg_symbol_search(tokens: list[str], cwd: Path | None = None) -> tuple[str, str | None] | None:
     if len(tokens) not in {2, 3}:
         return None
     if any(token.startswith("-") for token in tokens[1:]):
         return None
+    if cwd is not None and path_is_excluded_from_navigation(cwd):
+        return None
     query = tokens[1]
-    if not SYMBOL_RE.match(query):
+    if not is_strong_symbol_query(query):
         return None
     file_filter = None
     if len(tokens) == 3 and tokens[2] not in {".", "./"}:
         if "*" in tokens[2] or "?" in tokens[2] or "[" in tokens[2]:
             return None
+        if path_arg_is_excluded_from_navigation(tokens[2]):
+            return None
         file_filter = tokens[2].rstrip("/")
     return query, file_filter
 
 
-def parse_grep_recursive_symbol_search(tokens: list[str]) -> tuple[str, str | None] | None:
+def parse_grep_recursive_symbol_search(tokens: list[str], cwd: Path | None = None) -> tuple[str, str | None] | None:
     if len(tokens) not in {3, 4}:
         return None
     flags = tokens[1]
     if flags not in {"-R", "-r", "--recursive"}:
         return None
-    query = tokens[2]
-    if not SYMBOL_RE.match(query):
+    if cwd is not None and path_is_excluded_from_navigation(cwd):
         return None
-    file_filter = tokens[3].rstrip("/") if len(tokens) == 4 and tokens[3] not in {".", "./"} else None
+    query = tokens[2]
+    if not is_strong_symbol_query(query):
+        return None
+    file_filter = None
+    if len(tokens) == 4 and tokens[3] not in {".", "./"}:
+        if path_arg_is_excluded_from_navigation(tokens[3]):
+            return None
+        file_filter = tokens[3].rstrip("/")
     return query, file_filter
 
 
-def parse_recursive_listing(tokens: list[str]) -> str | None:
+def is_strong_symbol_query(query: str) -> bool:
+    if not SYMBOL_RE.match(query):
+        return False
+    if "::" in query:
+        return True
+    if query.isupper() or query.islower():
+        return False
+    return bool(STRONG_SYMBOL_RE.match(query))
+
+
+def parse_recursive_listing(tokens: list[str], cwd: Path | None = None) -> str | None:
+    if cwd is not None and path_is_excluded_from_navigation(cwd):
+        return None
     if tokens[0] == "tree":
         if len(tokens) == 1:
             return "."
         if len(tokens) == 2 and not tokens[1].startswith("-"):
+            if path_arg_is_excluded_from_navigation(tokens[1]):
+                return None
             return tokens[1]
         return None
     if tokens[0] != "ls":
@@ -379,13 +515,81 @@ def parse_recursive_listing(tokens: list[str]) -> str | None:
     if len(tokens) == 2 and tokens[1] in {"-R", "-lR", "-laR", "-Ral", "-Rla"}:
         return "."
     if len(tokens) == 3 and tokens[1] in {"-R", "-lR", "-laR", "-Ral", "-Rla"}:
+        if path_arg_is_excluded_from_navigation(tokens[2]):
+            return None
         return tokens[2]
     return None
 
 
+def parse_find_source_listing(tokens: list[str], cwd: Path | None = None) -> bool:
+    if not tokens or Path(tokens[0]).name != "find":
+        return False
+    if cwd is not None and path_is_excluded_from_navigation(cwd):
+        return False
+    if any(path_arg_is_excluded_from_navigation(token) for token in tokens[1:] if not token.startswith("-")):
+        return False
+    if any(token in {"-delete", "-exec", "-execdir", "-ok", "-okdir"} for token in tokens):
+        return False
+    if any(tokens[index] == "-type" and index + 1 < len(tokens) and tokens[index + 1] == "f" for index in range(len(tokens))):
+        return True
+    for index, token in enumerate(tokens[:-1]):
+        if token not in {"-name", "-iname", "-path", "-ipath"}:
+            continue
+        pattern = tokens[index + 1].lower()
+        if any(pattern.endswith(f"*{extension}") or pattern.endswith(extension) for extension in SOURCE_EXTS):
+            return True
+    return False
+
+
+def parse_git_grep_source_search(tokens: list[str], cwd: Path | None = None) -> bool:
+    if len(tokens) < 3 or Path(tokens[0]).name != "git" or tokens[1] != "grep":
+        return False
+    if cwd is not None and path_is_excluded_from_navigation(cwd):
+        return False
+    if any(path_arg_is_excluded_from_navigation(token) for token in tokens[3:] if not token.startswith("-")):
+        return False
+    for token in tokens[2:]:
+        if token == "--":
+            break
+        if token.startswith("-"):
+            continue
+        return True
+    return False
+
+
+def path_arg_is_excluded_from_navigation(path_arg: str) -> bool:
+    if not path_arg or path_arg in {".", "./"}:
+        return False
+    expanded = path_arg.replace("\\", "/")
+    parts = [part for part in Path(expanded).parts if part not in {"", os.sep}]
+    if any(part in EXCLUDED_NAV_PATH_PARTS for part in parts):
+        return True
+    suffix = Path(expanded).suffix.lower()
+    return suffix in EXCLUDED_NAV_SUFFIXES
+
+
+def path_is_excluded_from_navigation(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    expanded = resolved.as_posix()
+    project = git_root(resolved if resolved.is_dir() else resolved.parent)
+    try:
+        scoped = resolved.relative_to(project)
+    except ValueError:
+        scoped = resolved
+    parts = [part for part in scoped.parts if part not in {"", os.sep}]
+    return any(part in EXCLUDED_NAV_PATH_PARTS for part in parts)
+
+
 def resolve_source_file(cwd: Path, path_arg: str) -> Path | None:
+    if path_arg_is_excluded_from_navigation(path_arg):
+        return None
     path = resolve_existing_path(cwd, path_arg)
     if path is None or not path.is_file() or path.is_symlink():
+        return None
+    if path_is_excluded_from_navigation(path):
         return None
     if path.suffix.lower() in SOURCE_EXTS:
         return path
@@ -481,6 +685,255 @@ def pitlane_index_ready(pitlane_base: list[str], project: Path) -> bool:
     except Exception:
         return False
     return result.returncode == 0
+
+
+def ensure_pitlane_index_ready(
+    pitlane_base: list[str],
+    project: Path,
+    *,
+    payload: dict | None = None,
+    required: bool = True,
+) -> bool:
+    if pitlane_index_ready(pitlane_base, project):
+        return True
+    if not enabled(os.environ.get("PITLANE_CODEX_AUTO_INDEX", "1")):
+        return False
+    if not is_safe_auto_index_project(project):
+        record_telemetry(payload, "auto_index_skipped", project=project, reason="unsafe-project-root")
+        return False
+    timeout = int_env("PITLANE_CODEX_AUTO_INDEX_TIMEOUT_SECS", 6, 1, 60)
+    try:
+        result = subprocess.run(
+            [*pitlane_base, "index", str(project)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=float(timeout),
+        )
+    except Exception:
+        record_telemetry(payload, "auto_index_failed", project=project, reason="exception")
+        return not required and pitlane_index_ready(pitlane_base, project)
+    ok = result.returncode == 0 and pitlane_index_ready(pitlane_base, project)
+    record_telemetry(
+        payload,
+        "auto_index_ready" if ok else "auto_index_failed",
+        project=project,
+        reason=f"returncode={result.returncode}",
+    )
+    return ok or not required
+
+
+def is_safe_auto_index_project(project: Path) -> bool:
+    try:
+        resolved = project.resolve()
+    except OSError:
+        return False
+    if not is_under_trusted_auto_index_root(resolved):
+        return False
+    parts = resolved.parts
+    blocked = {"node_modules", ".git", "target", "dist", "build", ".cache", "__pycache__"}
+    if any(part in blocked for part in parts):
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(resolved), "ls-files"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=2.0,
+        )
+    except Exception:
+        return False
+    if result.returncode != 0:
+        return False
+    max_files = int_env("PITLANE_CODEX_AUTO_INDEX_MAX_FILES", 20000, 100, 200000)
+    return result.stdout.count("\n") <= max_files
+
+
+def trusted_auto_index_roots() -> list[Path]:
+    override = os.environ.get("PITLANE_CODEX_AUTO_INDEX_ROOTS")
+    if override:
+        roots = [Path(item).expanduser() for item in override.split(os.pathsep) if item.strip()]
+    else:
+        roots = [Path.home(), Path.cwd(), Path("/workspace")]
+    resolved_roots: list[Path] = []
+    for root in roots:
+        try:
+            resolved_roots.append(root.resolve())
+        except OSError:
+            continue
+    return resolved_roots
+
+
+def is_under_trusted_auto_index_root(path: Path) -> bool:
+    for root in trusted_auto_index_roots():
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def looks_like_source_navigation(tokens: list[str], cwd: Path) -> bool:
+    if not tokens:
+        return False
+    executable = Path(tokens[0]).name
+    if executable in {"cat", "head", "sed"}:
+        return any(resolve_source_file(cwd, token) is not None for token in tokens[1:] if not token.startswith("-"))
+    if executable in {"ls", "tree"}:
+        return parse_recursive_listing(tokens, cwd) is not None
+    if executable == "rg":
+        return parse_rg_symbol_search(tokens, cwd) is not None
+    if executable == "grep":
+        return parse_grep_recursive_symbol_search(tokens, cwd) is not None
+    if executable == "find":
+        return parse_find_source_listing(tokens, cwd)
+    if executable == "git":
+        return parse_git_grep_source_search(tokens, cwd)
+    return any(resolve_source_file(cwd, token) is not None for token in tokens[1:] if not token.startswith("-"))
+
+
+def classify_tokens(tokens: list[str], cwd: Path) -> str:
+    if not tokens:
+        return "empty"
+    executable = Path(tokens[0]).name
+    if executable in {"rg", "grep"}:
+        if parse_rg_symbol_search(tokens, cwd) is not None or parse_grep_recursive_symbol_search(tokens, cwd) is not None:
+            return "symbol-search"
+        return "literal-search"
+    if executable in {"cat", "head", "sed"}:
+        if any(resolve_source_file(cwd, token) is not None for token in tokens[1:] if not token.startswith("-")):
+            return "source-read"
+        return "file-read"
+    if executable in {"ls", "tree", "find"}:
+        return "listing"
+    if executable == "git":
+        if parse_git_grep_source_search(tokens, cwd):
+            return "git-grep"
+        return "git"
+    return "non-source"
+
+
+def should_hint_tokens(tokens: list[str], cwd: Path) -> bool:
+    if not tokens:
+        return False
+    executable = Path(tokens[0]).name
+    if executable in {"cat", "head", "sed"}:
+        return any(resolve_source_file(cwd, token) is not None for token in tokens[1:] if not token.startswith("-"))
+    if executable == "rg":
+        return parse_rg_symbol_search(tokens, cwd) is not None
+    if executable == "grep":
+        return parse_grep_recursive_symbol_search(tokens, cwd) is not None
+    if executable == "find":
+        return parse_find_source_listing(tokens, cwd)
+    if executable == "git":
+        return parse_git_grep_source_search(tokens, cwd)
+    if executable in {"ls", "tree"}:
+        return parse_recursive_listing(tokens, cwd) is not None
+    return False
+
+
+def record_decision(
+    payload: dict | None,
+    command: str,
+    decision: str,
+    command_class: str,
+    reason: str,
+    cwd: Path,
+) -> None:
+    if not enabled(os.environ.get("PITLANE_CODEX_TELEMETRY_DECISIONS")):
+        return
+    record_telemetry(
+        payload,
+        "decision",
+        project=git_root(cwd),
+        command=command,
+        reason=reason,
+        decision=decision,
+        command_class=command_class,
+    )
+
+
+def emit_missed_hint(command: str, command_field: str, reason: str) -> None:
+    if not enabled(os.environ.get("PITLANE_CODEX_HINT_MISSES", "1")):
+        return
+    output = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": (
+                f"Pitlane missed source-navigation opportunity: {reason}. "
+                "Prefer Pitlane symbol/search/lines/outline context or direct source-read commands."
+            ),
+        }
+    }
+    print(json.dumps(output, separators=(",", ":")))
+
+
+def telemetry_path() -> Path | None:
+    if not enabled(os.environ.get("PITLANE_CODEX_TELEMETRY", "0")):
+        return None
+    override = os.environ.get("PITLANE_CODEX_TELEMETRY_PATH")
+    if override:
+        return Path(override).expanduser()
+    state_home = os.environ.get("XDG_STATE_HOME")
+    if state_home:
+        return Path(state_home).expanduser() / "pitlane-codex-plugin" / "telemetry.jsonl"
+    return Path.home() / ".local" / "state" / "pitlane-codex-plugin" / "telemetry.jsonl"
+
+
+def record_telemetry(
+    payload: dict | None,
+    event: str,
+    *,
+    project: Path | None = None,
+    command: str = "",
+    reason: str = "",
+    decision: str | None = None,
+    command_class: str | None = None,
+) -> None:
+    path = telemetry_path()
+    if path is None:
+        return
+    record = {
+        "schema_version": 1,
+        "created_at": _dt.datetime.now(_dt.UTC).isoformat(),
+        "event": event,
+        "decision": decision,
+        "command_class": command_class,
+        "reason": reason,
+        "command_hash": command_hash(command),
+        "command_preview": command[:240]
+        if command and enabled(os.environ.get("PITLANE_CODEX_TELEMETRY_COMMAND_PREVIEW"))
+        else None,
+        "project": str(project) if project else None,
+        "session_id": payload.get("session_id") if isinstance(payload, dict) else None,
+        "turn_id": payload.get("turn_id") if isinstance(payload, dict) else None,
+        "tool_use_id": payload.get("tool_use_id") if isinstance(payload, dict) else None,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf8") as handle:
+            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except OSError:
+        return
+
+
+def record_missed_opportunity(
+    payload: dict | None,
+    command: str,
+    reason: str,
+    cwd: Path,
+) -> None:
+    record_telemetry(payload, "missed_opportunity", project=git_root(cwd), command=command, reason=reason)
+
+
+def command_hash(command: str) -> str | None:
+    if not command:
+        return None
+    return hashlib.sha256(command.encode("utf8", errors="replace")).hexdigest()
 
 
 def int_env(name: str, default: int, minimum: int, maximum: int) -> int:

@@ -22,7 +22,9 @@ Known integration layers:
   and it is intentionally not linked until that repo exists.
 
 Pitlane rewrites require a host-local `pitlane` binary in `PATH`. Symbol search
-and recursive listing rewrites also require a ready Pitlane project index.
+and recursive listing rewrites also require a ready Pitlane project index. The
+hook can make a short auto-index attempt for safe local worktrees. Missed
+source-navigation telemetry is compact and opt-in.
 
 ## Pass-Through Policy
 
@@ -39,7 +41,9 @@ The hook avoids rewriting commands where exact output is expected:
 - shell-control forms such as pipes, redirects, substitutions, and separators
 
 When the hook cannot prove a command is safe to rewrite, it emits no hook output
-and the runtime executes the original shell command unchanged.
+and the runtime executes the original shell command unchanged. For actionable
+source-navigation misses, including broad `find` and `git grep` shapes, it may
+emit a small `additionalContext` hint with the same original command.
 
 ## Dependency Boundary
 

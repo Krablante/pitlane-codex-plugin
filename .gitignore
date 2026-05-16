@@ -1,10 +1,9 @@
-# Local runtime and operator surfaces
+# Local runtime and developer surfaces
 .env
 .env.*
 !.env.example
-AGENTS.md
-AGENTS.local.md
-atlas.toml
+*.local
+.local/
 
 # Python/test caches
 __pycache__/
