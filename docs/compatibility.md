@@ -18,8 +18,8 @@ Known integration layers:
   support plugin-loaded `PreToolUse` shell hooks.
 - Telegram or remote-worker gateways can install or sync the plugin for worker
   machines, but no gateway is required for local usage. [Teledex](https://github.com/Krablante/teledex)
-  is the Codez-first Telegram gateway layer; its full mode is optimized for
-  Codez App Server v2, while upstream `codex exec --json` is legacy
+  is the Codez-first Telegram gateway layer; it requires Codez App Server v2
+  for normal public use, while upstream `codex exec --json` is legacy
   compatibility only.
 
 Pitlane rewrites require a host-local `pitlane` binary in `PATH`. Symbol search
