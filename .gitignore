@@ -17,3 +17,12 @@ tmp/
 .cache/
 artifacts/
 reports/
+screenshots/
+playwright-report/
+
+# Common dependency / build outputs
+target/
+node_modules/
+dist/
+coverage/
+public-dist/
