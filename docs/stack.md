@@ -26,7 +26,7 @@ CLI calls. Teledex is the Telegram/session gateway that can drive a runtime,
 but it is not part of the Codez runtime itself.
 
 Pitlane does not require Codez, RTK, or Teledex. Codez and RTK are linked
-because they have clean public releases. Teledex is linked as the Codez-first
+because they have clean public repositories. Teledex is linked as the Codez-first
 Telegram gateway layer; it can install or sync Pitlane for workers, but Pitlane
 remains usable without any gateway.
 

@@ -1,4 +1,9 @@
 # Local runtime and developer surfaces
+AGENTS.md
+AGENTS.local.md
+.agents/
+atlas.toml
+runtime.env
 .env
 .env.*
 !.env.example
