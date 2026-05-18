@@ -27,14 +27,21 @@ def payload(
     *,
     input_key: str = "command",
     tool_name: str = "Bash",
+    top_level_cwd: bool = True,
+    workdir: Path | None = None,
 ) -> str:
+    tool_input = {input_key: command}
+    if workdir is not None:
+        tool_input["workdir"] = str(workdir)
+    body = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+    }
+    if top_level_cwd:
+        body["cwd"] = str(cwd)
     return json.dumps(
-        {
-            "hook_event_name": "PreToolUse",
-            "tool_name": tool_name,
-            "cwd": str(cwd),
-            "tool_input": {input_key: command},
-        }
+        body
     )
 
 
@@ -54,6 +61,8 @@ class PitlaneCodexHookTest(unittest.TestCase):
         *,
         cwd: Path,
         env: dict[str, str] | None = None,
+        top_level_cwd: bool = True,
+        workdir: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         process_env = {
             **os.environ,
@@ -69,7 +78,12 @@ class PitlaneCodexHookTest(unittest.TestCase):
 
         return subprocess.run(
             [str(HOOK)],
-            input=payload(command, cwd),
+            input=payload(
+                command,
+                cwd,
+                top_level_cwd=top_level_cwd,
+                workdir=workdir,
+            ),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -210,7 +224,6 @@ class PitlaneCodexHookTest(unittest.TestCase):
             (root / "README.md").write_text("# readme\n", encoding="utf8")
             (root / "data.json").write_text('{"ok": true}\n', encoding="utf8")
             for command in [
-                "cat README.md",
                 "cat data.json",
                 "rg --files",
                 "rg --json needle",
@@ -245,7 +258,24 @@ class PitlaneCodexHookTest(unittest.TestCase):
                     result = self.run_hook(command, cwd=root)
                     self.assert_no_output(result)
 
-    def test_shell_control_source_navigation_stays_quiet(self) -> None:
+    def test_rewrites_markdown_context_reads(self) -> None:
+        with project_dir() as root:
+            readme = root / "README.md"
+            readme.write_text("\n".join(f"line {index}" for index in range(1, 300)), encoding="utf8")
+
+            result = self.run_hook("cat README.md", cwd=root)
+
+        self.assertEqual(self.rewritten_command(result), f"pitlane lines {root} README.md 1 220")
+
+    def test_rewrites_yaml_context_reads(self) -> None:
+        with project_dir() as root:
+            for name in ["config.yaml", "config.yml"]:
+                (root / name).write_text("name: demo\nvalue: true\n", encoding="utf8")
+                with self.subTest(name=name):
+                    result = self.run_hook(f"cat {name}", cwd=root)
+                    self.assertEqual(self.rewritten_command(result), f"pitlane lines {root} {name} 1 2")
+
+    def test_shell_control_source_navigation_rewrites_simple_line_limiter(self) -> None:
         with project_dir() as root:
             source = root / "src" / "app.py"
             source.parent.mkdir()
@@ -253,7 +283,83 @@ class PitlaneCodexHookTest(unittest.TestCase):
 
             result = self.run_hook("cat src/app.py | head -n 20", cwd=root)
 
-        self.assert_no_output(result)
+        self.assertEqual(self.rewritten_command(result), f"pitlane lines {root} src/app.py 1 1")
+
+    def test_nl_sed_source_navigation_rewrites_to_lines(self) -> None:
+        with project_dir() as root:
+            source = root / "src" / "app.py"
+            source.parent.mkdir()
+            source.write_text("\n".join(f"print({index})" for index in range(1, 30)), encoding="utf8")
+
+            result = self.run_hook("nl -ba src/app.py | sed -n '3,8p'", cwd=root)
+
+        self.assertEqual(self.rewritten_command(result), f"pitlane lines {root} src/app.py 3 8")
+
+    def test_decision_telemetry_includes_saved_token_estimate(self) -> None:
+        with project_dir() as root:
+            source = root / "src" / "big.py"
+            source.parent.mkdir()
+            source.write_text("\n".join("x" * 80 for _ in range(400)), encoding="utf8")
+            telemetry = root / "telemetry.jsonl"
+
+            result = self.run_hook(
+                "cat src/big.py",
+                cwd=root,
+                env={
+                    "PITLANE_CODEX_TELEMETRY": "1",
+                    "PITLANE_CODEX_TELEMETRY_DECISIONS": "1",
+                    "PITLANE_CODEX_TELEMETRY_PATH": str(telemetry),
+                },
+            )
+
+            self.assertIn("pitlane lines", self.rewritten_command(result))
+            records = [json.loads(line) for line in telemetry.read_text(encoding="utf8").splitlines()]
+            decision = [record for record in records if record.get("event") == "decision"][-1]
+            self.assertEqual(decision["decision"], "rewrite")
+            self.assertGreater(decision["estimated_saved_tokens"], 0)
+
+    def test_broad_read_telemetry_uses_full_file_size_estimate(self) -> None:
+        with project_dir() as root:
+            source = root / "src" / "huge.py"
+            source.parent.mkdir()
+            source.write_text("\n".join("x" * 10000 for _ in range(1000)), encoding="utf8")
+            telemetry = root / "telemetry.jsonl"
+
+            result = self.run_hook(
+                "cat src/huge.py",
+                cwd=root,
+                env={
+                    "PITLANE_CODEX_TELEMETRY": "1",
+                    "PITLANE_CODEX_TELEMETRY_DECISIONS": "1",
+                    "PITLANE_CODEX_TELEMETRY_PATH": str(telemetry),
+                },
+            )
+
+            self.assertIn("pitlane lines", self.rewritten_command(result))
+            records = [json.loads(line) for line in telemetry.read_text(encoding="utf8").splitlines()]
+            decision = [record for record in records if record.get("event") == "decision"][-1]
+            self.assertGreater(decision["estimated_saved_bytes"], 7_000_000)
+
+    def test_telemetry_file_permissions_are_private(self) -> None:
+        with project_dir() as root:
+            source = root / "src" / "app.py"
+            source.parent.mkdir()
+            source.write_text("print('x')\n", encoding="utf8")
+            telemetry = root / "private" / "telemetry.jsonl"
+
+            result = self.run_hook(
+                "cat src/app.py",
+                cwd=root,
+                env={
+                    "PITLANE_CODEX_TELEMETRY": "1",
+                    "PITLANE_CODEX_TELEMETRY_DECISIONS": "1",
+                    "PITLANE_CODEX_TELEMETRY_PATH": str(telemetry),
+                },
+            )
+
+            self.assertIn("pitlane lines", self.rewritten_command(result))
+            self.assertEqual(telemetry.parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(telemetry.stat().st_mode & 0o777, 0o600)
 
     def test_shell_control_literal_search_does_not_emit_source_navigation_hint(self) -> None:
         with project_dir() as root:
@@ -441,7 +547,7 @@ class PitlaneCodexHookTest(unittest.TestCase):
         self.assertFalse(telemetry.exists())
 
     def test_excluded_scope_cwd_is_not_source_navigation(self) -> None:
-        for scope in ["runtime-state", "log", "generated", "data", "archive", "state"]:
+        for scope in ["runtime-state", "atlas" + "-state", "log", "logs", "generated", "data", "archive", "state"]:
             with self.subTest(scope=scope), project_dir() as root, tempfile.TemporaryDirectory() as tmp:
                 scope_dir = root / scope
                 scope_dir.mkdir()
@@ -461,6 +567,17 @@ class PitlaneCodexHookTest(unittest.TestCase):
                     result = self.run_hook(command, cwd=scope_dir, env=env)
                     self.assert_no_output(result)
                 self.assertFalse(telemetry.exists())
+
+    def test_non_git_excluded_scope_cwd_is_not_source_navigation(self) -> None:
+        for scope in ["runtime-state", "atlas" + "-state", "log", "logs", "data", "state"]:
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory() as tmp:
+                scope_dir = Path(tmp) / scope
+                scope_dir.mkdir()
+                (scope_dir / "session.py").write_text("class CommandRunner: pass\n", encoding="utf8")
+                (scope_dir / "session.yaml").write_text("name: session\n", encoding="utf8")
+                for command in ["cat session.py", "cat session.yaml"]:
+                    result = self.run_hook(command, cwd=scope_dir)
+                    self.assert_no_output(result)
 
     def test_missing_pitlane_cli_does_not_fallback_to_docker_mcp(self) -> None:
         with project_dir() as root, tempfile.TemporaryDirectory() as tmp:
@@ -519,6 +636,46 @@ class PitlaneCodexHookTest(unittest.TestCase):
                 with self.subTest(command=command):
                     result = self.run_hook(command, cwd=root)
                     self.assert_no_output(result)
+
+    def test_exec_command_workdir_resolves_relative_paths(self) -> None:
+        with project_dir() as root:
+            (root / "README.md").write_text("root guidance\n", encoding="utf8")
+            plugin = root / "plugin"
+            plugin.mkdir()
+            (plugin / "README.md").write_text("plugin guidance\n", encoding="utf8")
+
+            result = self.run_hook(
+                "sed -n '1,20p' README.md",
+                cwd=root,
+                top_level_cwd=False,
+                workdir=plugin,
+            )
+
+        self.assertIn("plugin/README.md", self.rewritten_command(result))
+
+    def test_public_export_refuses_existing_unmarked_output_path(self) -> None:
+        exporter = PLUGIN_ROOT / "scripts" / "export-public-projection.sh"
+        if not exporter.exists():
+            self.skipTest("private public-projection exporter is not included in the public projection")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            unsafe = Path(tmp) / "not-public-dist"
+            unsafe.mkdir()
+            sentinel = unsafe / "keep.txt"
+            sentinel.write_text("keep\n", encoding="utf8")
+
+            result = subprocess.run(
+                [str(exporter), str(unsafe)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("refusing", result.stderr)
+            self.assertTrue(sentinel.exists())
 
 
 class project_dir:

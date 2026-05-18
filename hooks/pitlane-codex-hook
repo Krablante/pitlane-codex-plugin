@@ -45,6 +45,8 @@ SOURCE_EXTS = {
     ".kt",
     ".kts",
     ".lua",
+    ".md",
+    ".mdx",
     ".mjs",
     ".php",
     ".pl",
@@ -62,6 +64,8 @@ SOURCE_EXTS = {
     ".ts",
     ".tsx",
     ".vue",
+    ".yaml",
+    ".yml",
     ".zsh",
 }
 
@@ -80,6 +84,7 @@ EXCLUDED_NAV_PATH_PARTS = {
     ".git",
     "__pycache__",
     "archive",
+    "atlas" + "-state",
     "backups",
     "build",
     "data",
@@ -92,6 +97,15 @@ EXCLUDED_NAV_PATH_PARTS = {
     "state",
     "target",
     "tmp",
+}
+ABSOLUTE_EXCLUDED_NAV_PATH_PARTS = {
+    "atlas" + "-state",
+    "data",
+    "generated",
+    "log",
+    "logs",
+    "runtime-state",
+    "state",
 }
 EXCLUDED_NAV_SUFFIXES = {".json", ".jsonl", ".log", ".ndjson"}
 
@@ -121,7 +135,29 @@ def main() -> int:
     except OSError:
         cwd = Path(os.getcwd()).resolve()
 
+    pitlane_base = resolve_pitlane_base()
+    if not pitlane_base:
+        try:
+            tokens_for_class = shlex.split(command)
+        except ValueError:
+            tokens_for_class = []
+        record_decision(payload, command, "unavailable", classify_tokens(tokens_for_class, cwd), "pitlane-cli-unavailable", cwd)
+        return 0
+
     if SHELL_CONTROL_RE.search(command):
+        plan = build_shell_control_plan(pitlane_base, cwd, command, payload=payload)
+        if plan is not None:
+            record_decision(payload, command, "rewrite", "source-pipeline", "pitlane-plan", cwd, metrics=plan.metrics)
+            output = {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "updatedInput": {command_field: shell_join(plan.command)},
+                }
+            }
+            if plan.context:
+                output["hookSpecificOutput"]["additionalContext"] = plan.context
+            print(json.dumps(output, separators=(",", ":")))
+            return 0
         record_decision(payload, command, "pass", "shell-control", "shell-control-quiet", cwd)
         return 0
 
@@ -136,11 +172,6 @@ def main() -> int:
     if not tokens:
         return 0
 
-    pitlane_base = resolve_pitlane_base()
-    if not pitlane_base:
-        record_decision(payload, command, "unavailable", classify_tokens(tokens, cwd), "pitlane-cli-unavailable", cwd)
-        return 0
-
     plan = build_plan(tokens, cwd, pitlane_base, payload=payload, original_command=command)
     if plan is None:
         if should_hint_tokens(tokens, cwd):
@@ -149,7 +180,7 @@ def main() -> int:
         else:
             record_decision(payload, command, "pass", classify_tokens(tokens, cwd), "not-source-navigation", cwd)
         return 0
-    record_decision(payload, command, "rewrite", classify_tokens(tokens, cwd), "pitlane-plan", cwd)
+    record_decision(payload, command, "rewrite", classify_tokens(tokens, cwd), "pitlane-plan", cwd, metrics=plan.metrics)
 
     output = {
         "hookSpecificOutput": {
@@ -164,9 +195,10 @@ def main() -> int:
 
 
 class RewritePlan:
-    def __init__(self, command: list[str], context: str | None = None) -> None:
+    def __init__(self, command: list[str], context: str | None = None, metrics: dict | None = None) -> None:
         self.command = command
         self.context = context
+        self.metrics = metrics or {}
 
 
 def is_shell_tool(payload: dict) -> bool:
@@ -202,7 +234,15 @@ def safe_unwrap_shell_command(command: str) -> str:
 
 
 def cwd_from_payload(payload: dict) -> Path:
-    cwd = Path(payload.get("cwd") or os.getcwd())
+    cwd_value = payload.get("cwd")
+    tool_input = payload.get("tool_input")
+    if isinstance(tool_input, dict):
+        for key in ("workdir", "cwd"):
+            value = tool_input.get(key)
+            if isinstance(value, str) and value.strip():
+                cwd_value = value
+                break
+    cwd = Path(cwd_value or os.getcwd())
     if not cwd.is_absolute():
         cwd = Path(os.getcwd())
     try:
@@ -308,7 +348,7 @@ def build_plan(
     search_limit = int_env("PITLANE_CODEX_SEARCH_LIMIT", 30, 5, 100)
 
     if executable == "cat" and len(tokens) == 2 and not tokens[1].startswith("-"):
-        return plan_file_lines(pitlane_base, cwd, tokens[1], 1, max_lines, max_lines, payload=payload)
+        return plan_file_lines(pitlane_base, cwd, tokens[1], 1, max_lines, max_lines, payload=payload, requested_end=None)
 
     if executable == "head":
         parsed = parse_head(tokens)
@@ -322,6 +362,7 @@ def build_plan(
                 min(count, max_lines),
                 max_lines,
                 payload=payload,
+                requested_end=count,
             )
 
     if executable == "sed":
@@ -339,6 +380,7 @@ def build_plan(
                 capped_end,
                 max_lines,
                 payload=payload,
+                requested_end=end,
             )
 
     if executable == "rg":
@@ -398,6 +440,7 @@ def plan_file_lines(
     end: int,
     max_lines: int,
     payload: dict | None = None,
+    requested_end: int | None = None,
 ) -> RewritePlan | None:
     if path_arg_is_excluded_from_navigation(path_arg):
         return None
@@ -422,14 +465,113 @@ def plan_file_lines(
         return None
 
     command = [*pitlane_base, "lines", str(project), rel, str(start), str(end)]
+    metrics = estimate_line_savings(path, start, end, requested_end=requested_end, total_lines=total)
     context = (
         "Pitlane hook rewrote a broad source read to Pitlane lines. "
         "Ask for narrower line ranges or Pitlane symbol/search tools when more context is needed."
     )
-    return RewritePlan(command, context)
+    return RewritePlan(command, context, metrics)
+
+
+def build_shell_control_plan(
+    pitlane_base: list[str],
+    cwd: Path,
+    command: str,
+    *,
+    payload: dict | None = None,
+) -> RewritePlan | None:
+    segments = split_single_unquoted_pipe(command)
+    if segments is None:
+        return None
+    left_text, right_text = segments
+    try:
+        left = shlex.split(left_text)
+        right = shlex.split(right_text)
+    except ValueError:
+        return None
+    max_lines = int_env("PITLANE_CODEX_LINES_MAX", 220, 20, 1000)
+    if len(left) == 2 and Path(left[0]).name == "cat":
+        parsed_head = parse_head(right)
+        if parsed_head is not None and parsed_head[1] == "-":
+            count, _stdin = parsed_head
+            return plan_file_lines(
+                pitlane_base,
+                cwd,
+                left[1],
+                1,
+                min(count, max_lines),
+                max_lines,
+                payload=payload,
+                requested_end=count,
+            )
+    if len(left) == 3 and Path(left[0]).name == "nl" and left[1] == "-ba":
+        parsed = parse_sed_filter_range(right)
+        if parsed is not None:
+            start, end = parsed
+            return plan_file_lines(
+                pitlane_base,
+                cwd,
+                left[2],
+                start,
+                min(end, start + max_lines - 1),
+                max_lines,
+                payload=payload,
+                requested_end=end,
+            )
+    return None
+
+
+def split_single_unquoted_pipe(command: str) -> tuple[str, str] | None:
+    quote = ""
+    escaped = False
+    pipe_index: int | None = None
+    for index, char in enumerate(command):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quote != "'":
+            escaped = True
+            continue
+        if quote:
+            if char == quote:
+                quote = ""
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        if char in {";", "<", ">", "`", "$", "&", "\n", "\r"}:
+            return None
+        if char == "|":
+            if pipe_index is not None:
+                return None
+            pipe_index = index
+    if quote or pipe_index is None:
+        return None
+    left = command[:pipe_index].strip()
+    right = command[pipe_index + 1 :].strip()
+    if not left or not right:
+        return None
+    return left, right
+
+
+def parse_sed_filter_range(tokens: list[str]) -> tuple[int, int] | None:
+    if len(tokens) != 3 or Path(tokens[0]).name != "sed" or tokens[1] != "-n":
+        return None
+    match = SED_RANGE_RE.match(tokens[2])
+    if not match:
+        return None
+    start = int(match.group(1))
+    end = int(match.group(2) or match.group(1))
+    return (start, end) if end >= start else None
 
 
 def parse_head(tokens: list[str]) -> tuple[int, str] | None:
+    if len(tokens) == 1 and Path(tokens[0]).name == "head":
+        return 10, "-"
+    if len(tokens) == 3 and Path(tokens[0]).name == "head" and tokens[1] == "-n" and tokens[2].isdigit():
+        return int(tokens[2]), "-"
+    if len(tokens) == 2 and Path(tokens[0]).name == "head" and tokens[1].startswith("-n") and tokens[1][2:].isdigit():
+        return int(tokens[1][2:]), "-"
     if len(tokens) == 2:
         return 10, tokens[1]
     if len(tokens) == 4 and tokens[1] == "-n" and tokens[2].isdigit():
@@ -574,6 +716,9 @@ def path_is_excluded_from_navigation(path: Path) -> bool:
     except OSError:
         resolved = path
     expanded = resolved.as_posix()
+    absolute_parts = [part for part in resolved.parts if part not in {"", os.sep}]
+    if any(part in ABSOLUTE_EXCLUDED_NAV_PATH_PARTS for part in absolute_parts):
+        return True
     project = git_root(resolved if resolved.is_dir() else resolved.parent)
     try:
         scoped = resolved.relative_to(project)
@@ -605,6 +750,48 @@ def has_source_shebang(path: Path) -> bool:
     except OSError:
         return False
     return bool(SOURCE_SHEBANG_RE.match(first_line))
+
+
+def estimate_line_savings(
+    path: Path,
+    start: int,
+    visible_end: int,
+    *,
+    requested_end: int | None,
+    total_lines: int,
+) -> dict:
+    if requested_end is None and start == 1:
+        try:
+            requested_bytes = path.stat().st_size
+        except OSError:
+            requested_bytes = estimate_range_bytes(path, start, total_lines)
+    else:
+        requested_bytes = estimate_range_bytes(path, start, requested_end or total_lines)
+    visible_bytes = estimate_range_bytes(path, start, visible_end)
+    saved_bytes = max(0, requested_bytes - visible_bytes)
+    return {
+        "estimated_input_bytes": requested_bytes,
+        "estimated_output_bytes": visible_bytes,
+        "estimated_saved_bytes": saved_bytes,
+        "estimated_saved_tokens": max(0, round(saved_bytes / 4)),
+    }
+
+
+def estimate_range_bytes(path: Path, start: int, end: int) -> int:
+    if end < start:
+        return 0
+    total = 0
+    try:
+        with path.open("rb") as handle:
+            for line_no, line in enumerate(handle, 1):
+                if line_no < start:
+                    continue
+                if line_no > end:
+                    break
+                total += len(line)
+    except OSError:
+        return 0
+    return total
 
 
 def resolve_existing_path(cwd: Path, path_arg: str) -> Path | None:
@@ -843,6 +1030,7 @@ def record_decision(
     command_class: str,
     reason: str,
     cwd: Path,
+    metrics: dict | None = None,
 ) -> None:
     if not enabled(os.environ.get("PITLANE_CODEX_TELEMETRY_DECISIONS")):
         return
@@ -854,6 +1042,7 @@ def record_decision(
         reason=reason,
         decision=decision,
         command_class=command_class,
+        metrics=metrics,
     )
 
 
@@ -893,6 +1082,7 @@ def record_telemetry(
     reason: str = "",
     decision: str | None = None,
     command_class: str | None = None,
+    metrics: dict | None = None,
 ) -> None:
     path = telemetry_path()
     if path is None:
@@ -913,10 +1103,22 @@ def record_telemetry(
         "turn_id": payload.get("turn_id") if isinstance(payload, dict) else None,
         "tool_use_id": payload.get("tool_use_id") if isinstance(payload, dict) else None,
     }
+    if metrics:
+        for key, value in metrics.items():
+            if isinstance(value, int):
+                record[key] = value
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            path.parent.chmod(0o700)
+        except OSError:
+            pass
         with path.open("a", encoding="utf8") as handle:
             handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
     except OSError:
         return
 
