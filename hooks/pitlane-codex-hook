@@ -84,7 +84,7 @@ EXCLUDED_NAV_PATH_PARTS = {
     ".git",
     "__pycache__",
     "archive",
-    "atlas" + "-state",
+    "politia" + "-state",
     "backups",
     "build",
     "data",
@@ -99,7 +99,7 @@ EXCLUDED_NAV_PATH_PARTS = {
     "tmp",
 }
 ABSOLUTE_EXCLUDED_NAV_PATH_PARTS = {
-    "atlas" + "-state",
+    "politia" + "-state",
     "data",
     "generated",
     "log",

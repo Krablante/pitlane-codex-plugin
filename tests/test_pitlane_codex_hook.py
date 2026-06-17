@@ -547,7 +547,7 @@ class PitlaneCodexHookTest(unittest.TestCase):
         self.assertFalse(telemetry.exists())
 
     def test_excluded_scope_cwd_is_not_source_navigation(self) -> None:
-        for scope in ["runtime-state", "atlas" + "-state", "log", "logs", "generated", "data", "archive", "state"]:
+        for scope in ["runtime-state", "politia" + "-state", "log", "logs", "generated", "data", "archive", "state"]:
             with self.subTest(scope=scope), project_dir() as root, tempfile.TemporaryDirectory() as tmp:
                 scope_dir = root / scope
                 scope_dir.mkdir()
@@ -569,7 +569,7 @@ class PitlaneCodexHookTest(unittest.TestCase):
                 self.assertFalse(telemetry.exists())
 
     def test_non_git_excluded_scope_cwd_is_not_source_navigation(self) -> None:
-        for scope in ["runtime-state", "atlas" + "-state", "log", "logs", "data", "state"]:
+        for scope in ["runtime-state", "politia" + "-state", "log", "logs", "data", "state"]:
             with self.subTest(scope=scope), tempfile.TemporaryDirectory() as tmp:
                 scope_dir = Path(tmp) / scope
                 scope_dir.mkdir()

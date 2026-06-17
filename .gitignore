@@ -2,7 +2,6 @@
 AGENTS.md
 AGENTS.local.md
 .agents/
-atlas.toml
 runtime.env
 .env
 .env.*
